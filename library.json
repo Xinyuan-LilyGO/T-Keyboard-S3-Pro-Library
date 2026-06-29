@@ -1,0 +1,23 @@
+{
+  "name": "LILYGO T-Keyboard-S3-Pro Library",
+  "version": "0.1.0",
+  "description": "Driver library for LILYGO T-Keyboard-S3-Pro (up to five GC9107 128x128 IPS panels + five keys + 14 WS2812C RGB LEDs + optional rotary encoder). An STM32G030 co-processor multiplexes the panels' chip-select, reads the keys and drives the LEDs over I2C; the panels use LovyanGFX. Supports magnetically chained boards.",
+  "keywords": ["lilygo", "esp32s3", "keyboard", "display", "gc9107", "lovyangfx", "stm32", "ws2812", "ble", "hid"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Xinyuan-LilyGO/T-Keyboard-S3-Pro-Library.git"
+  },
+  "authors": [
+    { "name": "lbuque", "email": "1102390310@qq.com" }
+  ],
+  "license": "MIT",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"],
+  "build": {
+    "srcDir": "src"
+  },
+  "dependencies": {
+    "lovyan03/LovyanGFX": "^1.1.0",
+    "lbuque/ButtonSense": "^1.0.0"
+  }
+}

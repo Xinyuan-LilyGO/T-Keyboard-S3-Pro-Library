@@ -1,0 +1,71 @@
+#######################################
+# Syntax Coloring Map for T-Keyboard-S3-Pro
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+TKeyboardS3ProClass	KEYWORD1
+TKeyboardS3Pro	KEYWORD1
+Display	KEYWORD1
+RotaryEncoder	KEYWORD1
+BoardConfig	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+begin	KEYWORD2
+end	KEYWORD2
+update	KEYWORD2
+selectScreen	KEYWORD2
+deselectAllScreens	KEYWORD2
+screen	KEYWORD2
+screenCount	KEYWORD2
+setBrightness	KEYWORD2
+keys	KEYWORD2
+isPressed	KEYWORD2
+wasPressed	KEYWORD2
+wasReleased	KEYWORD2
+encoderPosition	KEYWORD2
+ledSetMode	KEYWORD2
+ledSetBrightness	KEYWORD2
+ledSetColor	KEYWORD2
+ledSelect	KEYWORD2
+ledClear	KEYWORD2
+ledShow	KEYWORD2
+setLeds	KEYWORD2
+scanDevices	KEYWORD2
+isDevicePresent	KEYWORD2
+firmwareVersion	KEYWORD2
+devices	KEYWORD2
+deviceCount	KEYWORD2
+refreshDevices	KEYWORD2
+isInitialized	KEYWORD2
+pins	KEYWORD2
+
+#######################################
+# Members (KEYWORD2)
+#######################################
+
+display	KEYWORD2
+encoder	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+SCREEN_COUNT	LITERAL1
+HOST_SCREEN_COUNT	LITERAL1
+KEY_COUNT	LITERAL1
+LED_COUNT	LITERAL1
+SCREEN_1	LITERAL1
+SCREEN_2	LITERAL1
+SCREEN_3	LITERAL1
+SCREEN_4	LITERAL1
+SCREEN_5	LITERAL1
+SCREEN_ALL	LITERAL1
+LED_MODE_NORMAL	LITERAL1
+LED_MODE_FREE	LITERAL1
+DEFAULT_ADDRESS	LITERAL1

@@ -3,17 +3,16 @@
 // Reads newline-delimited JSON from USB Serial (same wire protocol as
 // claude-desktop-buddy). No BLE in this file; see buddy_ble.h.
 //
-// Wire protocol (desktop → device):
-//   {"total":N,"running":N,"waiting":N,"completed":bool,"tokens_today":N,
-//    "msg":"...","entries":["line",...],
-//    "prompt":{"id":"...","tool":"...","hint":"..."}}
-//
-// Commands (device → desktop):
-//   {"cmd":"permission","id":"...","decision":"once"}
-//   {"cmd":"permission","id":"...","decision":"deny"}
+// Include order in Buddy.ino:
+//   buddy_stats.h → buddy_ble.h → buddy_character.h → buddy_xfer.h
+//   → buddy_data.h (last, uses xferCommand + statsOnBridgeTokens)
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+
+// Forward declaration — xferCommand is defined in buddy_xfer.h (included
+// before buddy_data.h in Buddy.ino).
+bool xferCommand(JsonDocument& doc);
 
 struct BuddyState {
     uint8_t  sessionsTotal;
@@ -46,12 +45,19 @@ static void _buddyApplyJson(const char* line, BuddyState* out) {
     JsonDocument doc;
     if (deserializeJson(doc, line)) return;
 
+    // Transfer/control commands handled by buddy_xfer.h (included by Buddy.ino).
+    // xferCommand is declared via forward decl; returns true if it consumed the doc.
+    if (xferCommand(doc)) { _buddyLastLiveMs = millis(); return; }
+
     // Time sync — desktop sends {"time":[epoch_sec, tz_offset_sec]}
     JsonArray t = doc["time"];
     if (!t.isNull() && t.size() == 2) {
         _buddyLastLiveMs = millis();
         return; // no RTC on T-Keyboard-S3-Pro, just mark alive
     }
+
+    // Token accounting — feed NVS stats
+    if (doc["tokens"].is<uint32_t>()) statsOnBridgeTokens(doc["tokens"].as<uint32_t>());
 
     out->sessionsTotal     = doc["total"]     | out->sessionsTotal;
     out->sessionsRunning   = doc["running"]   | out->sessionsRunning;

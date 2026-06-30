@@ -2,52 +2,53 @@
  * Buddy — A Claude desktop companion for the LILYGO T-Keyboard-S3-Pro.
  *
  * Connects to the Claude desktop app (or claude-desktop-buddy bridge) over
- * USB Serial (115200 baud) or BLE (Nordic UART Service).  Displays Claude
- * session state across the host's four 128×128 GC9107 panels and lets you
- * approve/deny permission requests with the physical keys.
+ * USB Serial (115200 baud) or BLE (Nordic UART Service).
  *
  * Panel layout (left → right):
- *   [0] Cat animation — 7 states driven by Claude activity
+ *   [0] Character — GIF animation (if installed) or ASCII cat fallback
  *   [1] Session status — running / waiting / total sessions
  *   [2] Transcript / approval prompt
- *   [3] Token counter + key guide
+ *   [3] Token counter + stats + key guide
  *
  * Keys:
- *   KEY1 (panel 0) — approve pending permission ("once")
- *   KEY2 (panel 1) — deny pending permission
- *   KEY3 (panel 2) — cycle display brightness
- *   KEY5           — toggle BLE advertising display
+ *   KEY1 — approve pending permission ("once")
+ *   KEY2 — deny pending permission
+ *   KEY3 — cycle display brightness
+ *   KEY5 — show BLE/connection status on panel 3
  *
- * Wire protocol: newline-delimited JSON on USB Serial (or BLE NUS).
- * See buddy_data.h for the schema.
+ * Filesystem: LittleFS at /characters/<name>/ (manifest.json + GIF files).
+ * Install a character pack with the claude-desktop-buddy desktop tool over BLE.
  *
- * Dependencies (add to your library manager or library.json):
- *   - TKeyboardS3Pro (this library)
- *   - ArduinoJson  >= 7.x
- *   - ButtonSense  (bundled with TKeyboardS3Pro)
- *   - ESP32 BLE Arduino (ships with the esp32 Arduino core)
+ * NVS (Preferences): approvals, denials, tokens, level, pet name, owner.
  *
- * Anti-flicker: each panel has a 128x128 LGFX_Sprite in PSRAM. All drawing
- * goes into the sprite; a single pushSprite() transfers it to the display at
- * the end of each frame — no intermediate black frame, no visible flicker.
+ * Anti-flicker: 128×128 LGFX_Sprite per panel in PSRAM; pushSprite() at
+ * frame end — no intermediate black frame.
+ *
+ * Include order matters:
+ *   stats → ble → character_h → xfer (needs stats+ble+character) →
+ *   data (needs xfer+stats) → cat (fallback ASCII) → Buddy.ino
  */
 
 #include <TKeyboardS3Pro.h>
-#include "buddy_data.h"
-#include "buddy_cat.h"
-#include "buddy_ble.h"
+#include <LittleFS.h>
+#include "buddy_stats.h"      // NVS persistence (include first)
+#include "buddy_ble.h"        // BLE NUS bridge
+#include "buddy_character.h"  // LittleFS + AnimatedGIF renderer
+#include "buddy_xfer.h"       // BLE file-transfer protocol (needs stats+ble+character)
+#include "buddy_data.h"       // JSON state parser (needs xfer+stats)
+#include "buddy_cat.h"        // ASCII cat fallback
+
+// ---------------------------------------------------------------------------
+// Render mode
+// ---------------------------------------------------------------------------
+bool gGifMode      = false;   // true → draw GIF; false → draw ASCII cat
+bool gGifAvailable = false;   // true once a character pack is installed
 
 // ---------------------------------------------------------------------------
 // Persona state
 // ---------------------------------------------------------------------------
 enum PersonaState : uint8_t {
-    P_SLEEP = 0,
-    P_IDLE,
-    P_BUSY,
-    P_ATTENTION,
-    P_CELEBRATE,
-    P_DIZZY,
-    P_HEART
+    P_SLEEP = 0, P_IDLE, P_BUSY, P_ATTENTION, P_CELEBRATE, P_DIZZY, P_HEART
 };
 
 static PersonaState _oneShotState = P_IDLE;
@@ -68,27 +69,30 @@ static PersonaState derivePersona(const BuddyState& st) {
 }
 
 // ---------------------------------------------------------------------------
-// Sprites — one per panel, allocated in PSRAM at setup()
+// Sprites — one per panel in PSRAM
 // ---------------------------------------------------------------------------
-static LGFX_Sprite spr[4];   // spr[0]..spr[3] map to displayAt(0)..displayAt(3)
+LGFX_Sprite spr[4];   // declared extern in buddy_character.cpp
 
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
-static BuddyState  gState     = {};
-static uint32_t    gTick      = 0;
-static uint32_t    gLastDraw  = 0;
-static uint8_t     gBrightness = 200;
+static BuddyState gState      = {};
+static uint32_t   gTick       = 0;
+static uint32_t   gLastDraw   = 0;
+static uint8_t    gBrightness = 178;  // default 70% (255*0.7)
 
 static _BuddyLineBuf<512> _bleLine;
 
-static bool     _wasCompleted = false;
-static uint32_t _lastTokens   = 0;
+static bool     _wasCompleted  = false;
+static uint32_t _lastTokens    = 0;
+static uint32_t _approveStartMs = 0;   // timestamp when prompt appeared
+
+// ---- approval prompt start time (for velocity tracking) ----
+static uint32_t _promptArrivedMs = 0;
 
 // ---------------------------------------------------------------------------
-// Drawing helpers (operate on a sprite, not a Display)
+// Drawing helpers
 // ---------------------------------------------------------------------------
-
 static const uint16_t COL_BG    = TFT_BLACK;
 static const uint16_t COL_FG    = TFT_WHITE;
 static const uint16_t COL_DIM   = 0x8410;
@@ -96,6 +100,7 @@ static const uint16_t COL_GREEN = TFT_GREEN;
 static const uint16_t COL_YEL   = TFT_YELLOW;
 static const uint16_t COL_RED   = TFT_RED;
 static const uint16_t COL_CYAN  = TFT_CYAN;
+static const uint16_t COL_ORANGE= 0xFC60;
 
 static inline int centerX(LGFX_Sprite& s, const char* str) {
     return (128 - (int)s.textWidth(str)) / 2;
@@ -104,29 +109,44 @@ static inline int centerXInt(LGFX_Sprite& s, int v) {
     char buf[12]; itoa(v, buf, 10); return centerX(s, buf);
 }
 
-// ---- Panel 0: Cat -----------------------------------------------------------
-static void drawCat(PersonaState persona) {
+// ---- Panel 0: character (GIF or ASCII cat) ----------------------------------
+static void drawCharacter(PersonaState persona) {
     LGFX_Sprite& s = spr[0];
     s.setTextSize(1);
 
-    switch (persona) {
-        case P_SLEEP:     catSleep    (s, gTick); break;
-        case P_IDLE:      catIdle     (s, gTick); break;
-        case P_BUSY:      catBusy     (s, gTick); break;
-        case P_ATTENTION: catAttention(s, gTick); break;
-        case P_CELEBRATE: catCelebrate(s, gTick); break;
-        case P_DIZZY:     catDizzy    (s, gTick); break;
-        case P_HEART:     catHeart    (s, gTick); break;
+    if (gGifMode && gGifAvailable) {
+        // GIF mode: characterTick() already drew into spr[0].
+        // We only need to overlay the status dot and BLE badge.
+    } else {
+        // ASCII cat fallback
+        switch (persona) {
+            case P_SLEEP:     catSleep    (s, gTick); break;
+            case P_IDLE:      catIdle     (s, gTick); break;
+            case P_BUSY:      catBusy     (s, gTick); break;
+            case P_ATTENTION: catAttention(s, gTick); break;
+            case P_CELEBRATE: catCelebrate(s, gTick); break;
+            case P_DIZZY:     catDizzy    (s, gTick); break;
+            case P_HEART:     catHeart    (s, gTick); break;
+        }
     }
 
+    // Status dot bottom-left
     uint16_t dotCol = gState.connected ? COL_GREEN : COL_DIM;
     if (gState.promptId[0]) dotCol = COL_YEL;
     s.fillCircle(6, 122, 3, dotCol);
 
+    // BLE badge bottom-right
     if (bleConnected()) {
         s.setTextColor(COL_CYAN, COL_BG);
         s.setCursor(110, 118);
         s.print("BT");
+    }
+
+    // Transfer progress bar (bottom, replaces BLE badge during xfer)
+    if (xferActive() && xferTotal() > 0) {
+        uint8_t pct = (uint8_t)(xferProgress() * 100 / xferTotal());
+        s.fillRect(0, 124, 128, 4, COL_DIM);
+        s.fillRect(0, 124, pct * 128 / 100, 4, COL_CYAN);
     }
 
     spr[0].pushSprite(&TKeyboardS3Pro.displayAt(0), 0, 0);
@@ -138,31 +158,47 @@ static void drawStatus() {
     s.fillScreen(COL_BG);
     s.setTextSize(1);
 
+    // Pet name header
     s.setTextColor(COL_DIM, COL_BG);
-    s.setCursor(centerX(s, "CLAUDE STATUS"), 4);
-    s.print("CLAUDE STATUS");
+    s.setCursor(centerX(s, petName()), 2);
+    s.print(petName());
 
+    // Big running count
     s.setTextSize(4);
     s.setTextColor(gState.sessionsRunning > 0 ? COL_GREEN : COL_DIM, COL_BG);
-    s.setCursor(centerXInt(s, gState.sessionsRunning), 24);
+    s.setCursor(centerXInt(s, gState.sessionsRunning), 20);
     s.printf("%d", gState.sessionsRunning);
 
     s.setTextSize(1);
     s.setTextColor(COL_DIM, COL_BG);
-    s.setCursor(centerX(s, "running"), 60);
+    s.setCursor(centerX(s, "running"), 58);
     s.print("running");
 
-    s.drawFastHLine(4, 72, 120, COL_DIM);
+    s.drawFastHLine(4, 70, 120, COL_DIM);
 
     s.setTextColor(COL_FG, COL_BG);
     char totalBuf[16]; snprintf(totalBuf, sizeof(totalBuf), "total:   %d", gState.sessionsTotal);
     char waitBuf[16];  snprintf(waitBuf,  sizeof(waitBuf),  "waiting: %d", gState.sessionsWaiting);
-    s.setCursor(centerX(s, totalBuf), 80); s.print(totalBuf);
-    s.setCursor(centerX(s, waitBuf),  92); s.print(waitBuf);
+    s.setCursor(centerX(s, totalBuf), 78); s.print(totalBuf);
+    s.setCursor(centerX(s, waitBuf),  90); s.print(waitBuf);
 
+    // Level + fed bar
+    char lvlBuf[16]; snprintf(lvlBuf, sizeof(lvlBuf), "Lv%d", stats().level);
+    s.setTextColor(COL_ORANGE, COL_BG);
+    s.setCursor(4, 102);
+    s.print(lvlBuf);
+
+    // 10-pip fed bar
+    uint8_t pips = statsFedProgress();
+    for (int i = 0; i < 10; i++) {
+        uint16_t col = (i < pips) ? COL_ORANGE : COL_DIM;
+        s.fillRect(40 + i * 8, 102, 6, 6, col);
+    }
+
+    // Msg
     s.setTextColor(COL_YEL, COL_BG);
     char truncMsg[22]; strncpy(truncMsg, gState.msg, 21); truncMsg[21] = 0;
-    s.setCursor(centerX(s, truncMsg), 108);
+    s.setCursor(centerX(s, truncMsg), 114);
     s.print(truncMsg);
 
     spr[1].pushSprite(&TKeyboardS3Pro.displayAt(1), 0, 0);
@@ -200,6 +236,28 @@ static void drawTranscript() {
         s.setTextColor(COL_RED, COL_BG);
         s.setCursor(centerX(s, "KEY2=deny"), 106);
         s.print("KEY2=deny");
+    } else if (xferActive()) {
+        // Transfer progress screen
+        s.setTextColor(COL_CYAN, COL_BG);
+        s.setCursor(centerX(s, "INSTALLING"), 4);
+        s.print("INSTALLING");
+
+        s.setTextColor(COL_FG, COL_BG);
+        s.setCursor(centerX(s, _xCharName), 18);
+        s.print(_xCharName);
+
+        uint32_t tot = xferTotal();
+        uint32_t prog = xferProgress();
+        uint8_t pct = tot > 0 ? (uint8_t)(prog * 100 / tot) : 0;
+        char pctBuf[8]; snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
+        s.setTextSize(3);
+        s.setTextColor(COL_CYAN, COL_BG);
+        s.setCursor(centerX(s, pctBuf), 46);
+        s.print(pctBuf);
+
+        s.setTextSize(1);
+        s.fillRect(4, 84, 120, 8, COL_DIM);
+        s.fillRect(4, 84, (int)(pct * 120 / 100), 8, COL_CYAN);
     } else {
         s.setTextColor(COL_DIM, COL_BG);
         s.setCursor(centerX(s, "TRANSCRIPT"), 4);
@@ -228,14 +286,14 @@ static void drawTranscript() {
     spr[2].pushSprite(&TKeyboardS3Pro.displayAt(2), 0, 0);
 }
 
-// ---- Panel 3: Tokens + key guide --------------------------------------------
+// ---- Panel 3: Tokens + stats + key guide ------------------------------------
 static void drawTokens() {
     LGFX_Sprite& s = spr[3];
     s.fillScreen(COL_BG);
     s.setTextSize(1);
 
     s.setTextColor(COL_DIM, COL_BG);
-    s.setCursor(centerX(s, "TOKENS TODAY"), 4);
+    s.setCursor(centerX(s, "TOKENS TODAY"), 2);
     s.print("TOKENS TODAY");
 
     char tokBuf[12];
@@ -246,20 +304,28 @@ static void drawTokens() {
 
     s.setTextSize(2);
     s.setTextColor(COL_CYAN, COL_BG);
-    s.setCursor(centerX(s, tokBuf), 18);
+    s.setCursor(centerX(s, tokBuf), 14);
     s.print(tokBuf);
 
     s.setTextSize(1);
-    s.drawFastHLine(4, 42, 120, COL_DIM);
+    // Mood / approvals / denials
+    s.setTextColor(COL_DIM, COL_BG);
+    char statBuf[24];
+    snprintf(statBuf, sizeof(statBuf), "ok:%u no:%u mood:%u",
+             stats().approvals, stats().denials, statsMoodTier());
+    s.setCursor(centerX(s, statBuf), 36);
+    s.print(statBuf);
 
-    static const char* const GUIDE[] = { "KEY1 approve", "KEY2 deny", "KEY3 bright", "KEY5 BLE" };
+    s.drawFastHLine(4, 46, 120, COL_DIM);
+
+    static const char* const GUIDE[] = { "KEY1 approve", "KEY2 deny", "KEY3 status", "KEY5 dim rst" };
     s.setTextColor(COL_DIM, COL_BG);
     for (int i = 0; i < 4; i++) {
-        s.setCursor(centerX(s, GUIDE[i]), 48 + i * 12);
+        s.setCursor(centerX(s, GUIDE[i]), 50 + i * 12);
         s.print(GUIDE[i]);
     }
 
-    s.drawFastHLine(4, 96, 120, COL_DIM);
+    s.drawFastHLine(4, 98, 120, COL_DIM);
 
     if (gState.connected) {
         const char* badge = bleConnected() ? "BLE connected" : "USB connected";
@@ -273,8 +339,8 @@ static void drawTokens() {
     }
 
     s.setTextColor(COL_DIM, COL_BG);
-    s.setCursor(centerX(s, "TKB-S3-Buddy"), 118);
-    s.print("TKB-S3-Buddy");
+    s.setCursor(centerX(s, petName()), 116);
+    s.print(petName());
 
     spr[3].pushSprite(&TKeyboardS3Pro.displayAt(3), 0, 0);
 }
@@ -285,19 +351,43 @@ static void drawTokens() {
 void setup() {
     Serial.begin(115200);
 
+    // NVS
+    statsLoad();
+    petNameLoad();
+
+    // Filesystem
+    if (!LittleFS.begin(true)) {
+        Serial.println("[fs] LittleFS format failed");
+    } else {
+        Serial.printf("[fs] mounted, %lu/%lu bytes used\n",
+                      (unsigned long)LittleFS.usedBytes(),
+                      (unsigned long)LittleFS.totalBytes());
+        // Try to load the last installed character.
+        if (characterInit(nullptr)) {
+            gGifAvailable = true;
+            gGifMode = true;  // character pack found → always use GIF
+        }
+    }
+
     TKeyboardS3Pro.begin();
     TKeyboardS3Pro.setBrightness(gBrightness);
     TKeyboardS3Pro.fillAllScreens(TFT_BLACK);
 
-    // Allocate sprites in PSRAM (128x128x2 = 32 KB each, 128 KB total)
+    // Sprites in PSRAM
     for (int i = 0; i < 4; i++) {
         spr[i].setPsram(true);
         spr[i].setColorDepth(16);
-        spr[i].createSprite(128, 128);
+        bool ok = spr[i].createSprite(128, 128);
+        Serial.printf("[spr] %d: %s (heap free: %u)\n", i, ok ? "OK" : "FAIL", ESP.getFreeHeap());
+        if (!ok) {
+            // PSRAM unavailable — fall back to internal RAM
+            spr[i].setPsram(false);
+            spr[i].createSprite(128, 128);
+        }
         spr[i].fillScreen(TFT_BLACK);
     }
 
-    // Rainbow LED sweep to signal boot
+    // Rainbow boot sweep
     for (int h = 0; h < 360; h += 30) {
         TKeyboardS3Pro.setLeds(h, 80, 30);
         delay(40);
@@ -306,9 +396,10 @@ void setup() {
 
     bleInit("TKB-S3-Buddy");
 
+    // Initial draw
     gState.connected = false;
     strncpy(gState.msg, "No Claude connected", sizeof(gState.msg) - 1);
-    drawCat(P_SLEEP);
+    drawCharacter(P_SLEEP);
     drawStatus();
     drawTranscript();
     drawTokens();
@@ -320,30 +411,45 @@ void setup() {
 void loop() {
     TKeyboardS3Pro.update();
 
+    // ---- Encoder → brightness ----
+    {
+        static long _lastEncPos = 0;
+        long pos = TKeyboardS3Pro.encoderPosition();
+        long delta = pos - _lastEncPos;
+        if (delta != 0) {
+            _lastEncPos = pos;
+            int v = (int)gBrightness + (int)(delta * 26);  // ~10% per detent
+            if (v < 5)   v = 5;
+            if (v > 255) v = 255;
+            gBrightness = (uint8_t)v;
+            TKeyboardS3Pro.setBrightness(gBrightness);
+        }
+    }
+
     // ---- Key handling ----
-    if (TKeyboardS3Pro.key(0).wasClicked()) {
+    if (TKeyboardS3Pro.key(0).wasClicked()) {   // KEY1 — approve
         if (gState.promptId[0]) {
+            uint32_t elapsed = _promptArrivedMs ? (millis() - _promptArrivedMs) / 1000 : 0;
+            statsOnApproval(elapsed);
             buddySendPermission(gState.promptId, true);
             gState.promptId[0] = 0;
             triggerOneShot(P_HEART, 3000);
         }
     }
-    if (TKeyboardS3Pro.key(1).wasClicked()) {
+    if (TKeyboardS3Pro.key(1).wasClicked()) {   // KEY2 — deny
         if (gState.promptId[0]) {
+            statsOnDenial();
             buddySendPermission(gState.promptId, false);
             gState.promptId[0] = 0;
             triggerOneShot(P_DIZZY, 2000);
         }
     }
-    if (TKeyboardS3Pro.key(2).wasClicked()) {
-        static const uint8_t BRT[] = { 60, 120, 200, 255 };
-        static uint8_t bIdx = 2;
-        bIdx = (bIdx + 1) % 4;
-        gBrightness = BRT[bIdx];
-        TKeyboardS3Pro.setBrightness(gBrightness);
-    }
-    if (TKeyboardS3Pro.key(4).wasClicked()) {
+    if (TKeyboardS3Pro.key(2).wasClicked()) {   // KEY3 — refresh stats panel
         drawTokens();
+    }
+    if (TKeyboardS3Pro.key(4).wasClicked()) {   // KEY5 — reset brightness to 70%
+        gBrightness = 178;
+        TKeyboardS3Pro.setBrightness(gBrightness);
     }
 
     // ---- BLE → data parser ----
@@ -364,9 +470,16 @@ void loop() {
     // ---- USB Serial → data parser ----
     buddyDataPoll(&gState);
 
+    // ---- Track prompt arrival for velocity ----
+    static bool _hadPrompt = false;
+    if (gState.promptId[0] && !_hadPrompt) _promptArrivedMs = millis();
+    _hadPrompt = gState.promptId[0] != 0;
+
     // ---- One-shot triggers ----
     if (gState.recentlyCompleted && !_wasCompleted) triggerOneShot(P_CELEBRATE, 4000);
     _wasCompleted = gState.recentlyCompleted;
+
+    if (statsPollLevelUp()) triggerOneShot(P_CELEBRATE, 5000);
 
     if (gState.tokensToday / 50000 > _lastTokens / 50000 && gState.tokensToday > 0)
         triggerOneShot(P_CELEBRATE, 3000);
@@ -374,6 +487,12 @@ void loop() {
 
     // ---- Persona resolution ----
     PersonaState persona = (millis() < _oneShotEnd) ? _oneShotState : derivePersona(gState);
+
+    // Sync GIF state to persona
+    if (gGifMode && gGifAvailable) {
+        characterSetState((uint8_t)persona);
+        characterTick();  // draws into spr[0]
+    }
 
     // ---- LED accent ----
     static uint32_t _lastLedMs = 0;
@@ -398,10 +517,10 @@ void loop() {
         gLastDraw = now;
         gTick++;
 
-        drawCat(persona);
+        drawCharacter(persona);
 
         static uint8_t _drawDiv = 0;
-        if (++_drawDiv >= 4) {    // text panels at ~5 fps
+        if (++_drawDiv >= 4) {  // text panels at ~5 fps
             _drawDiv = 0;
             drawStatus();
             drawTranscript();
